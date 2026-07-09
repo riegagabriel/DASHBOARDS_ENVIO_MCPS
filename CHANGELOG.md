@@ -333,3 +333,26 @@ reordenamiento y mapa de coropletas (ambos modos) en Vista 3 — incluyendo el
 ciclo completo de diagnóstico del bug de `px.choropleth` descrito arriba,
 que solo se detectó al mirar el render real (la data y el código "se veían
 bien" en el DOM/accesibilidad hasta que se inspeccionó visualmente).
+
+### Ajustes finos post-revisión (mismo día)
+
+Tras revisar el resultado, el usuario pidió 3 retoques puntuales:
+
+- **Mapa "Estado del error" muy claro:** la escala `Blues` completa incluye
+  tonos casi blancos para valores bajos, dejando "lavadas" las provincias con
+  pocos errores. Fix: se recorta la escala (`px.colors.sequential.Blues[3:]`)
+  y se sube la opacidad de 0.75 a 0.85.
+- **Mapa "Causa específica" pedía elegir una causa a la vez:** se cambió a
+  mostrar, sin selector, la **categoría de causa predominante por
+  provincia** (la que tiene más MCPs dentro de esa provincia), coloreada de
+  forma discreta con `CAUSA_CATEGORIA_COLOR_MAP` — todas las causas visibles
+  a la vez en un solo mapa.
+- **Orden del eje en "Trayectoria de electores por etapa" (Ficha por MCP):**
+  el DataFrame ya tenía `ETAPA` como categórica ordenada, pero `px.line` no
+  heredaba ese orden de forma confiable. Fix: `category_orders={"ETAPA":
+  ETAPAS_ORDEN}` explícito en la llamada a `px.line`.
+
+Verificado en vivo: el mapa de estado se ve más saturado, el mapa de causa
+muestra 5 categorías con colores distintos sin pedir selección, y la
+trayectoria de una MCP con hueco en abril (`TINGUA`, Áncash) grafica en el
+orden correcto FEBRERO→ABRIL→JUNIO_1→JUNIO_2→FINAL.

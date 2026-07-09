@@ -730,35 +730,62 @@ elif pagina == "⚠️  Mapa de errores":
             st.error(f"No se pudo leer geofiles/PROVINCIA.gpkg: {exc}")
 
         if geojson_prov is not None:
+            # Nota técnica: se usa choropleth_map (MapLibre) y NO choropleth
+            # (geo/d3-geo) porque este último tiene un bug de renderizado
+            # confirmado en esta versión de Plotly con GeoJSON custom de
+            # muchos polígonos: en vez de recortar cada polígono a su forma
+            # real, pinta todo el lienzo con el color de la última
+            # feature. choropleth_map no tiene ese problema y además trae
+            # mapa base real (ríos, fronteras, ciudades) de regalo.
+            mapa_kwargs = dict(
+                geojson=geojson_prov, locations="ID_PROV",
+                featureidkey="properties.ID_PROV",
+                center={"lat": -9.2, "lon": -75.0}, zoom=4.3, opacity=0.85,
+            )
+
             if modo_mapa == "Estado del error":
                 agg = df_err_nacional.groupby("ID_PROV").size().reset_index(name="MCPs con error")
-                color_col, color_scale, titulo = "MCPs con error", "Blues", "MCPs con error por provincia"
+                if agg.empty:
+                    st.info("No hay MCPs para esta selección.")
+                else:
+                    # Escala Blues recortada (sin los tonos casi blancos) para
+                    # que hasta las provincias con pocos errores se vean con
+                    # un azul reconocible en vez de quedar lavadas.
+                    fig_map = px.choropleth_map(
+                        agg, color="MCPs con error",
+                        color_continuous_scale=px.colors.sequential.Blues[3:],
+                        title="MCPs con error por provincia",
+                        **mapa_kwargs,
+                    )
+                    fig_map.update_layout(margin=dict(t=40, b=10, l=0, r=0), height=560)
+                    st.plotly_chart(fig_map, width="stretch")
             else:
-                causas_categoria = sorted(df_err_nacional["CAUSA_CATEGORIA"].dropna().unique().tolist())
-                causa_map_sel = st.selectbox("Categoría de causa", causas_categoria, key="causa_mapa")
-                df_causa = df_err_nacional[df_err_nacional["CAUSA_CATEGORIA"] == causa_map_sel]
-                agg = df_causa.groupby("ID_PROV").size().reset_index(name="MCPs")
-                color_col, color_scale = "MCPs", "Reds"
-                titulo = f"MCPs con causa '{causa_map_sel}' por provincia"
-
-            if agg.empty:
-                st.info("No hay MCPs para esta selección.")
-            else:
-                # Nota técnica: se usa choropleth_map (MapLibre) y NO choropleth
-                # (geo/d3-geo) porque este último tiene un bug de renderizado
-                # confirmado en esta versión de Plotly con GeoJSON custom de
-                # muchos polígonos: en vez de recortar cada polígono a su forma
-                # real, pinta todo el lienzo con el color de la última
-                # feature. choropleth_map no tiene ese problema y además trae
-                # mapa base real (ríos, fronteras, ciudades) de regalo.
-                fig_map = px.choropleth_map(
-                    agg, geojson=geojson_prov, locations="ID_PROV",
-                    featureidkey="properties.ID_PROV", color=color_col,
-                    color_continuous_scale=color_scale, title=titulo,
-                    center={"lat": -9.2, "lon": -75.0}, zoom=4.3, opacity=0.75,
+                # Causa predominante por provincia: para cada provincia con
+                # error se cuenta cuántas MCPs caen en cada categoría de
+                # causa y se colorea por la categoría más frecuente — así se
+                # ven todas las causas a la vez, sin necesidad de un filtro.
+                por_causa = (
+                    df_err_nacional.groupby(["ID_PROV", "CAUSA_CATEGORIA"])
+                    .size()
+                    .reset_index(name="MCPs")
                 )
-                fig_map.update_layout(margin=dict(t=40, b=10, l=0, r=0), height=560)
-                st.plotly_chart(fig_map, width="stretch")
+                if por_causa.empty:
+                    st.info("No hay MCPs para esta selección.")
+                else:
+                    idx_dominante = por_causa.groupby("ID_PROV")["MCPs"].idxmax()
+                    agg = por_causa.loc[idx_dominante].reset_index(drop=True)
+                    fig_map = px.choropleth_map(
+                        agg, color="CAUSA_CATEGORIA",
+                        color_discrete_map=CAUSA_CATEGORIA_COLOR_MAP,
+                        hover_data={"MCPs": True},
+                        title="Causa de error predominante por provincia",
+                        **mapa_kwargs,
+                    )
+                    fig_map.update_layout(
+                        margin=dict(t=40, b=10, l=0, r=0), height=560,
+                        legend_title="Categoría de causa",
+                    )
+                    st.plotly_chart(fig_map, width="stretch")
 
     st.divider()
 
@@ -911,6 +938,7 @@ elif pagina == "🔍  Ficha por MCP":
                             df_mcp_evol.sort_values("ETAPA"), x="ETAPA", y="CANTIDAD",
                             markers=True, symbol="ES_ESTIMADO",
                             symbol_map={True: "circle-open", False: "circle"},
+                            category_orders={"ETAPA": ETAPAS_ORDEN},
                         )
                         fig_tl.update_traces(line_color=RENIEC_AZUL)
                         fig_tl.update_layout(
