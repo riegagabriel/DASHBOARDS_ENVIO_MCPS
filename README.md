@@ -39,6 +39,12 @@ DASHBOARD_MCPS_PROBLEMAS/
 ├── app.py                 ← dashboard Streamlit (ejecutar desde aquí)
 ├── DATABASES/
 │   └── PADRON_MODIFICACIONES_VF.xlsx   ← fuente única del dashboard (no modificar)
+├── geofiles/
+│   ├── DEPARTAMENTO.gpkg  ← límites departamentales (no usado aún en la UI)
+│   ├── PROVINCIA.gpkg     ← límites provinciales, usado por el mapa de coropletas
+│   └── DISTRITO.gpkg      ← límites distritales (no usado aún en la UI)
+├── .streamlit/
+│   └── config.toml        ← tema visual (azul institucional RENIEC #002F56)
 ├── notebooks/
 │   └── AUDITORIA_MODIFICACIONES.ipynb  ← pipeline de limpieza/consolidación documentado
 ├── outputs/               ← df_padron.xlsx, df_evolucion.xlsx, df_errores.xlsx
@@ -145,6 +151,12 @@ columnas "efectivas":
   (un error que sigue pendiente pesa más que uno ya subsanado).
 - `CAUSA`: causa unificada — toma `ERROR_PENDIENTE_CAUSA` si está pendiente,
   `CAUSA_ERROR_SUBSANADO` si está subsanado, `NaN` si no tiene error.
+- `CAUSA_CATEGORIA`: agrupación de `CAUSA` en 6 categorías legibles (función
+  `categorizar_causa()`, coincidencia por substring): *Error de revisión
+  manual*, *GEO: omisión de listas/anexos*, *GEO: información desactualizada
+  o extemporánea*, *GEO: asignación incorrecta (códigos/DNI)*, *Electores de
+  otro distrito quitados*, *Otras causas puntuales*. Solo para UI — `CAUSA`
+  conserva el texto original íntegro.
 
 ### `df_evolucion` — tabla larga (una fila por MCP × etapa)
 
@@ -161,25 +173,43 @@ donde la MCP nace.
 
 ## Las 4 vistas del dashboard
 
-1. **Resumen ejecutivo** — 5 KPIs (MCPs totales, electores finales,
-   subsanados, pendientes, nuevas post-febrero) + evolución del total de
-   electores por etapa (line chart) + composición por estado de error (dona)
-   + tabla de top causas de error subsanado.
-2. **Evolución de electores** — actividad por ronda de corrección (cuántas
-   MCPs se tocaron en cada una) + Top 20 MCPs por variación absoluta +
-   distribución de "¿cuántas veces se corrigió cada MCP?" + tabla filtrable
-   por departamento con las 5 etapas y la variación, descargable a Excel.
-3. **Mapa de errores** — tabla filtrable (departamento, provincia, estado de
-   error, causa) descargable a Excel; barra apilada de errores por
-   departamento × estado; **dos treemaps** a nivel de MCP individual
-   (Departamento → Provincia → MCP): uno coloreado por estado del error
-   (subsanado/pendiente), otro por causa.
-4. **Ficha por MCP** — buscador por nombre o código; para cada resultado
-   muestra métricas (electores finales, variación, estado de error), causa
-   y detalle si tiene error, un line chart de trayectoria por etapa (marcador
-   relleno = dato real, hueco = arrastrado por ffill), y una tabla de
-   trayectoria coloreada (verde = subió/primera aparición, naranja = bajó,
-   gris = sin cambio o sin dato).
+1. **Resumen ejecutivo** — 5 KPIs (los dos primeros con una línea de texto
+   explicativo debajo) + gráfico combinado (barras de MCPs corregidas por
+   etapa + línea de electores totales) + composición por estado de error
+   (dona) + tabla de top causas de error subsanado (agrupadas en 6
+   categorías) + barra horizontal de causas por provincia (Top 15).
+2. **Evolución de electores** — Top 20 MCPs por variación absoluta (con un
+   popover explicando qué significa subir/bajar) + proporción de MCPs según
+   su nº de correcciones (barra 100% apilada) + tabla filtrable por
+   departamento y provincia, con encabezados en español legible, descargable
+   a Excel.
+3. **Mapa de errores** — filtros (departamento, provincia, estado, causa) →
+   gráfico de errores por provincia (respeta los filtros) → **mapa de
+   coropletas** a nivel provincia (`geofiles/PROVINCIA.gpkg`) con selector
+   "Estado del error" / "Causa específica" → tabla filtrable al final,
+   descargable a Excel.
+4. **Ficha por MCP** — buscador por nombre, código, departamento y/o
+   provincia; para cada resultado muestra métricas (electores finales,
+   variación, estado de error), causa y detalle si tiene error, un line
+   chart de trayectoria por etapa (marcador relleno = dato real, hueco =
+   arrastrado por ffill), y una tabla de trayectoria coloreada (verde =
+   subió/primera aparición, naranja = bajó, gris = sin cambio o sin dato).
+
+### Mapa de coropletas (Vista 3) — notas técnicas
+
+- Usa `px.choropleth_map` (MapLibre), **no** `px.choropleth` (geo/d3-geo):
+  esta última tiene un bug de renderizado confirmado en la versión de Plotly
+  del proyecto con GeoJSON custom de muchos polígonos — en vez de recortar
+  cada polígono a su forma real, pinta todo el lienzo con el color de la
+  última feature. Reproducido incluso con un GeoJSON mínimo de 3 cuadrados;
+  `choropleth_map` no tiene ese problema y de paso trae un mapa base real
+  (ríos, fronteras, ciudades).
+- `load_provincia_geojson()` lee `geofiles/PROVINCIA.gpkg`, arma una clave
+  `ID_PROV = "DEPARTAMENTO - PROVINCIA"` y corrige un alias de escritura
+  confirmado: `"ANTONIO RAYMONDI"` (geopackage) = `"ANTONIO RAIMONDI"`
+  (padrón), en Áncash. El match es 180/180 provincias del padrón.
+- Si `geopandas` no está instalado, la vista muestra una advertencia en vez
+  de romper el resto de la pestaña (`GEOPANDAS_OK` flag).
 
 ---
 

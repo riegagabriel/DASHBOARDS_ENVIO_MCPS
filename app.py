@@ -11,6 +11,7 @@ subsanados (con su causa) y cuáles siguen pendientes de resolución.
 
 Fuente de datos: DATABASES/PADRON_MODIFICACIONES_VF.xlsx (fuente única,
 una fila por MCP con las 4 etapas de corrección + metadata de errores).
+Límites geográficos para el mapa de coropletas: geofiles/*.gpkg (provincia).
 Pipeline de limpieza y consolidación: ver notebooks/AUDITORIA_MODIFICACIONES.ipynb
 (misma lógica, documentada paso a paso con etapas numeradas).
 
@@ -19,6 +20,7 @@ Documentación completa: ver README.md en la raíz del proyecto.
 """
 
 import io
+import json
 import re
 import unicodedata
 from pathlib import Path
@@ -26,18 +28,24 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
+
+try:
+    import geopandas as gpd
+    GEOPANDAS_OK = True
+except ImportError:
+    GEOPANDAS_OK = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-# Definir la ruta base apuntando a la carpeta de datos
-DATABASES = Path("DATABASES") 
-
-# Ahora esto funcionará correctamente
-PADRON_PATH = DATABASES / "PADRON_MODIFICACIONES_VF.xlsx"
+DATABASES_DIR = Path(__file__).parent / "DATABASES"
+PADRON_PATH = DATABASES_DIR / "PADRON_MODIFICACIONES_VF.xlsx"
+GEOFILES_DIR = Path(__file__).parent / "geofiles"
+PROVINCIA_GPKG = GEOFILES_DIR / "PROVINCIA.gpkg"
 
 ETAPAS_ORDEN = ["FEBRERO", "ABRIL", "JUNIO_1", "JUNIO_2", "FINAL"]
 
@@ -113,6 +121,29 @@ def normalize_cod(x, width: int = 9) -> str:
         return str(int(float(x))).zfill(width)
     except (ValueError, TypeError):
         return pd.NA
+
+
+def categorizar_causa(causa) -> str:
+    """Agrupa las ~12 causas crudas en 6 categorías legibles (propuesta B,
+    aprobada con el usuario). Usa coincidencia por substring (no igualdad
+    exacta) para tolerar variantes menores de redacción sin mantener un
+    diccionario 1 a 1 con el texto exacto del Excel."""
+    if pd.isna(causa):
+        return np.nan
+    c = causa.lower()
+    if "revisión manual" in c or "revision manual" in c:
+        return "Error de revisión manual"
+    if "distrito" in c and "quitad" in c:
+        return "Electores de otro distrito quitados"
+    if "no validada" in c:
+        return "Otras causas puntuales"
+    if any(k in c for k in ["omitió la inclusión", "omitio la inclusion", "omitió un anexo", "omitio un anexo", "faltó incluir", "falto incluir"]):
+        return "GEO: omisión de listas/anexos"
+    if any(k in c for k in ["desactualizada", "extemporaneo", "extemporáneo", "extemporaneos", "extemporáneos"]):
+        return "GEO: información desactualizada o extemporánea"
+    if any(k in c for k in ["asignó erroneamente", "asigno erroneamente", "dni"]):
+        return "GEO: asignación incorrecta (códigos/DNI)"
+    return "Otras causas puntuales"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,6 +233,9 @@ def load_data():
         return np.nan
 
     df["CAUSA"] = df.apply(causa_unificada, axis=1)
+    # Categoría agrupada de la causa (6 buckets legibles) — solo para UI,
+    # no reemplaza a CAUSA (que conserva el texto original íntegro).
+    df["CAUSA_CATEGORIA"] = df["CAUSA"].apply(categorizar_causa)
 
     # ── df_evolucion: tabla larga MCP × etapa (para gráficos de tendencia) ──
     etapa_col = {
@@ -227,6 +261,26 @@ def load_data():
     return df, df_evolucion
 
 
+@st.cache_data(show_spinner=False)
+def load_provincia_geojson():
+    """Lee geofiles/PROVINCIA.gpkg y devuelve un GeoJSON (dict) con una
+    propiedad ID_PROV = "DEPARTAMENTO - PROVINCIA" para unir con `df` vía
+    px.choropleth (featureidkey="properties.ID_PROV").
+
+    Simplifica la geometría (tolerancia ~1 km) para que el payload sea liviano
+    en Streamlit Cloud. Corrige un alias de escritura confirmado entre la
+    fuente del padrón y el geopackage: "ANTONIO RAYMONDI" (geopackage) es la
+    misma provincia que "ANTONIO RAIMONDI" (padrón), en Áncash.
+    """
+    gdf = gpd.read_file(PROVINCIA_GPKG)
+    gdf["nombdep"] = gdf["nombdep"].str.upper().str.strip()
+    gdf["nombprov"] = gdf["nombprov"].str.upper().str.strip()
+    gdf["nombprov"] = gdf["nombprov"].replace({"ANTONIO RAYMONDI": "ANTONIO RAIMONDI"})
+    gdf["ID_PROV"] = gdf["nombdep"] + " - " + gdf["nombprov"]
+    gdf["geometry"] = gdf["geometry"].simplify(0.01, preserve_topology=True)
+    return json.loads(gdf[["ID_PROV", "nombdep", "nombprov", "geometry"]].to_json())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,10 +292,28 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+# ── Paleta institucional RENIEC ──────────────────────────────────────────────
+# Azul marino oficial (#002F56, confirmado en el manual gráfico de RENIEC)
+# como color primario/neutro; semáforo semántico para estado de error para
+# no perder la lectura inmediata de "bien / subsanado / pendiente".
+RENIEC_AZUL = "#002F56"
+RENIEC_AZUL_CLARO = "#2E6F9E"
+RENIEC_AZUL_SUAVE = "#EAF1F8"
+RENIEC_GRIS = "#7F8C8D"
+
 ESTADO_COLOR_MAP = {
     "SIN ERROR": "#27AE60",
-    "SUBSANADO": "#2980B9",
-    "PENDIENTE": "#E74C3C",
+    "SUBSANADO": RENIEC_AZUL_CLARO,
+    "PENDIENTE": "#C0392B",
+}
+
+CAUSA_CATEGORIA_COLOR_MAP = {
+    "Error de revisión manual": RENIEC_AZUL,
+    "GEO: omisión de listas/anexos": RENIEC_AZUL_CLARO,
+    "GEO: información desactualizada o extemporánea": "#6FA3C7",
+    "GEO: asignación incorrecta (códigos/DNI)": "#A9C4DE",
+    "Electores de otro distrito quitados": "#C0392B",
+    "Otras causas puntuales": RENIEC_GRIS,
 }
 
 TIMELINE_COLORES = {
@@ -250,6 +322,33 @@ TIMELINE_COLORES = {
     "SUBIO": "#D5E8D4",
     "BAJO": "#FFE6CC",
 }
+
+# Nombres de columnas más explícitos para tablas orientadas al usuario final
+# (solo afecta la presentación; el DataFrame interno conserva sus nombres).
+DISPLAY_NAMES = {
+    "DEPARTAMENTO": "Departamento",
+    "PROVINCIA": "Provincia",
+    "DISTRITO": "Distrito",
+    "MCP": "MCP",
+    "COD_MCP_RENIEC": "Código RENIEC",
+    "ESTADO_ERROR": "Estado del error",
+    "CAUSA": "Causa del error",
+    "CAUSA_CATEGORIA": "Categoría de causa",
+    "ELECTORES_FEBRERO": "Electores (febrero)",
+    "CORRECCION_ABRIL": "Corrección (abril)",
+    "CORRECCION_JUNIO_1": "Corrección (junio, 1ª ronda)",
+    "CORRECCION_JUNIO_2": "Corrección (junio, 2ª ronda)",
+    "CANTIDAD_FINAL": "Electores (final)",
+    "VARIACION_ABS": "Variación absoluta",
+    "VARIACION_PCT": "Variación (%)",
+    "N_CORRECCIONES": "N° de correcciones",
+}
+
+
+def con_nombres_amigables(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve una copia solo para mostrar/descargar con encabezados legibles."""
+    return df_in.rename(columns=DISPLAY_NAMES)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CARGA
@@ -299,7 +398,9 @@ if pagina == "🏠  Resumen ejecutivo":
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("MCPs totales", f"{total_mcps:,}")
+    c1.caption("Municipalidades de Centro Poblado registradas en el padrón.")
     c2.metric("Electores (final)", f"{electores_finales:,}")
+    c2.caption("Suma de electores en la etapa final consolidada.")
     c3.metric("Errores subsanados", f"{n_subsanados:,}", f"{pct_subsanados:.1f} %")
     c4.metric("Errores pendientes", f"{n_pendientes:,}", f"−{pct_pendientes:.1f} %", delta_color="inverse")
     c5.metric("MCPs nuevas (post-febrero)", f"{n_nuevas:,}")
@@ -309,19 +410,54 @@ if pagina == "🏠  Resumen ejecutivo":
     col_l, col_r = st.columns([3, 2])
 
     with col_l:
-        st.subheader("Evolución del padrón — total de electores por etapa")
+        st.subheader("Evolución del padrón — electores totales y MCPs corregidas por etapa")
+        st.caption(
+            "La línea muestra el total de electores acumulado en cada etapa; las barras "
+            "muestran cuántas MCPs tuvieron un dato reportado explícitamente en esa ronda "
+            "(no arrastrado de una etapa anterior)."
+        )
         evol_total = (
             df_evolucion.groupby("ETAPA", observed=True)["CANTIDAD"]
             .sum()
             .reindex(ETAPAS_ORDEN)
             .reset_index(name="Total de electores")
         )
-        fig_evol = px.line(
-            evol_total, x="ETAPA", y="Total de electores",
-            markers=True, text="Total de electores",
+        mcps_por_etapa = pd.Series(
+            {
+                "FEBRERO": df["ELECTORES_FEBRERO"].notna().sum(),
+                "ABRIL": df["CORRECCION_ABRIL"].notna().sum(),
+                "JUNIO_1": df["CORRECCION_JUNIO_1"].notna().sum(),
+                "JUNIO_2": df["CORRECCION_JUNIO_2"].notna().sum(),
+                "FINAL": df["CANTIDAD_FINAL"].notna().sum(),
+            }
+        ).reindex(ETAPAS_ORDEN)
+
+        fig_evol = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_evol.add_trace(
+            go.Bar(
+                x=ETAPAS_ORDEN, y=mcps_por_etapa.values,
+                name="MCPs corregidas en la etapa",
+                marker_color=RENIEC_AZUL_SUAVE,
+                marker_line_color=RENIEC_AZUL_CLARO, marker_line_width=1,
+                text=mcps_por_etapa.values, textposition="outside",
+            ),
+            secondary_y=False,
         )
-        fig_evol.update_traces(texttemplate="%{text:,}", textposition="top center")
-        fig_evol.update_layout(margin=dict(t=10, b=10), yaxis_title="Electores", xaxis_title="Etapa")
+        fig_evol.add_trace(
+            go.Scatter(
+                x=ETAPAS_ORDEN, y=evol_total["Total de electores"],
+                name="Total de electores", mode="lines+markers+text",
+                line=dict(color=RENIEC_AZUL, width=3),
+                text=evol_total["Total de electores"].map("{:,}".format),
+                textposition="top center",
+            ),
+            secondary_y=True,
+        )
+        fig_evol.update_layout(
+            margin=dict(t=10, b=10), legend=dict(orientation="h", y=-0.15),
+        )
+        fig_evol.update_yaxes(title_text="MCPs corregidas", secondary_y=False)
+        fig_evol.update_yaxes(title_text="Total de electores", secondary_y=True)
         st.plotly_chart(fig_evol, width="stretch")
 
     with col_r:
@@ -339,16 +475,51 @@ if pagina == "🏠  Resumen ejecutivo":
         st.plotly_chart(fig_estado, width="stretch")
 
     st.divider()
-    st.subheader("Top causas de error subsanado")
-    causas = (
-        df[df["ESTADO_ERROR"] == "SUBSANADO"]
-        .groupby("CAUSA")
-        .size()
-        .reset_index(name="Cantidad")
-        .sort_values("Cantidad", ascending=False)
-    )
-    causas["% del total subsanado"] = (causas["Cantidad"] / n_subsanados * 100).map("{:.1f} %".format)
-    st.dataframe(causas, hide_index=True, width="stretch")
+
+    col_causa, col_prov = st.columns([2, 3])
+
+    with col_causa:
+        st.subheader("Top causas de error subsanado")
+        st.caption("Causas agrupadas en 6 categorías para facilitar la lectura.")
+        causas = (
+            df[df["ESTADO_ERROR"] == "SUBSANADO"]
+            .groupby("CAUSA_CATEGORIA")
+            .size()
+            .reset_index(name="Cantidad")
+            .sort_values("Cantidad", ascending=False)
+            .rename(columns={"CAUSA_CATEGORIA": "Categoría de causa"})
+        )
+        causas["% del total subsanado"] = (causas["Cantidad"] / n_subsanados * 100).map("{:.1f} %".format)
+        st.dataframe(causas, hide_index=True, width="stretch")
+
+    with col_prov:
+        st.subheader("¿En qué provincias se dieron las causas de error?")
+        st.caption("Top 15 provincias con más MCPs con error, por categoría de causa.")
+        errores_prov = (
+            df[df["ESTADO_ERROR"] != "SIN ERROR"]
+            .assign(PROV_LABEL=lambda d: d["PROVINCIA"] + " (" + d["DEPARTAMENTO"] + ")")
+            .groupby(["PROV_LABEL", "CAUSA_CATEGORIA"])
+            .size()
+            .reset_index(name="MCPs")
+        )
+        if errores_prov.empty:
+            st.info("No hay MCPs con error para mostrar.")
+        else:
+            top_provs = (
+                errores_prov.groupby("PROV_LABEL")["MCPs"].sum().nlargest(15).index.tolist()
+            )
+            fig_prov_causa = px.bar(
+                errores_prov[errores_prov["PROV_LABEL"].isin(top_provs)],
+                x="MCPs", y="PROV_LABEL", orientation="h",
+                color="CAUSA_CATEGORIA", color_discrete_map=CAUSA_CATEGORIA_COLOR_MAP,
+                labels={"PROV_LABEL": "Provincia", "CAUSA_CATEGORIA": "Categoría de causa"},
+            )
+            fig_prov_causa.update_layout(
+                yaxis={"categoryorder": "total ascending"},
+                margin=dict(t=10, b=10), legend=dict(orientation="h", y=-0.2),
+                height=460,
+            )
+            st.plotly_chart(fig_prov_causa, width="stretch")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,31 +529,22 @@ if pagina == "🏠  Resumen ejecutivo":
 elif pagina == "📈  Evolución de electores":
     st.title("Evolución de electores")
 
-    st.subheader("Actividad por ronda de corrección")
-    st.caption("Cuántas MCPs tuvieron un dato reportado explícitamente en cada ronda (no arrastrado).")
-    actividad = pd.DataFrame({
-        "Ronda": ["FEBRERO", "ABRIL", "JUNIO_1", "JUNIO_2"],
-        "MCPs corregidas": [
-            df["ELECTORES_FEBRERO"].notna().sum(),
-            df["CORRECCION_ABRIL"].notna().sum(),
-            df["CORRECCION_JUNIO_1"].notna().sum(),
-            df["CORRECCION_JUNIO_2"].notna().sum(),
-        ],
-    })
-    fig_act = px.bar(
-        actividad, x="Ronda", y="MCPs corregidas", text="MCPs corregidas",
-        color="MCPs corregidas", color_continuous_scale="Blues",
-    )
-    fig_act.update_traces(textposition="outside")
-    fig_act.update_layout(coloraxis_showscale=False, margin=dict(t=10, b=10))
-    st.plotly_chart(fig_act, width="stretch")
-
-    st.divider()
-
     col_l, col_r = st.columns(2)
 
     with col_l:
-        st.subheader("Top 20 MCPs por variación absoluta (Feb. → Final)")
+        sub_l, pop_l = st.columns([4, 1])
+        sub_l.subheader("Top 20 MCPs por variación absoluta (Feb. → Final)")
+        with pop_l.popover("ℹ️"):
+            st.write(
+                "Cada barra es cuánto cambió el conteo de electores de una MCP entre el "
+                "primer registro (febrero) y el valor final consolidado.\n\n"
+                "- **Verde (subió):** normalmente refleja electores agregados en una "
+                "corrección posterior (nuevos empadronados o anexos incorporados).\n"
+                "- **Rojo (bajó):** suele corresponder a correcciones donde se retiraron "
+                "electores que habían sido asignados por error a esta MCP o a un distrito "
+                "equivocado. Para ver la causa exacta de una MCP puntual, revisa la pestaña "
+                "**Mapa de errores** o **Ficha por MCP**."
+            )
         variadas = (
             df[df["VARIACION_ABS"].notna()]
             .assign(Signo=lambda d: np.where(d["VARIACION_ABS"] >= 0, "Subió", "Bajó"))
@@ -391,7 +553,7 @@ elif pagina == "📈  Evolución de electores":
         )
         fig_var = px.bar(
             variadas, x="VARIACION_ABS", y="MCP", orientation="h",
-            color="Signo", color_discrete_map={"Subió": "#27AE60", "Bajó": "#E74C3C"},
+            color="Signo", color_discrete_map={"Subió": "#27AE60", "Bajó": "#C0392B"},
             text="VARIACION_ABS",
             hover_data={"DEPARTAMENTO": True, "PROVINCIA": True},
         )
@@ -405,19 +567,34 @@ elif pagina == "📈  Evolución de electores":
 
     with col_r:
         st.subheader("¿Cuántas veces se corrigió cada MCP?")
+        st.caption("Proporción de MCPs según su número de correcciones (0 a 3 rondas).")
         dist_correcciones = (
             df["N_CORRECCIONES"].value_counts().sort_index().reset_index()
         )
-        dist_correcciones.columns = ["Nº de correcciones", "Cantidad de MCPs"]
-        fig_ncorr = px.bar(
-            dist_correcciones, x="Nº de correcciones", y="Cantidad de MCPs",
-            text="Cantidad de MCPs", color="Cantidad de MCPs",
-            color_continuous_scale="Purples",
+        dist_correcciones.columns = ["N_CORRECCIONES", "Cantidad"]
+        dist_correcciones["Nº de correcciones"] = dist_correcciones["N_CORRECCIONES"].map(
+            lambda n: f"{n} corrección(es)"
         )
-        fig_ncorr.update_traces(textposition="outside")
+        dist_correcciones["Grupo"] = "Todas las MCPs"
+        dist_correcciones["Porcentaje"] = dist_correcciones["Cantidad"] / total_mcps * 100
+
+        pct_sin_correccion = dist_correcciones.loc[
+            dist_correcciones["N_CORRECCIONES"] == 0, "Porcentaje"
+        ].sum()
+        st.metric("MCPs sin ninguna corrección", f"{pct_sin_correccion:.1f} %")
+
+        fig_ncorr = px.bar(
+            dist_correcciones, x="Porcentaje", y="Grupo", orientation="h",
+            color="Nº de correcciones", barmode="stack",
+            color_discrete_sequence=px.colors.sequential.Blues[2:],
+            text=dist_correcciones["Porcentaje"].map("{:.1f}%".format),
+            hover_data={"Cantidad": True},
+        )
+        fig_ncorr.update_traces(textposition="inside")
         fig_ncorr.update_layout(
-            coloraxis_showscale=False, margin=dict(t=10, b=10),
-            xaxis=dict(tickmode="linear", dtick=1), height=500,
+            margin=dict(t=10, b=10), height=340,
+            xaxis_title="% de MCPs", yaxis_title="",
+            legend=dict(orientation="h", y=-0.3),
         )
         st.plotly_chart(fig_ncorr, width="stretch")
 
@@ -425,11 +602,19 @@ elif pagina == "📈  Evolución de electores":
 
     st.subheader("Tabla de correcciones por MCP")
     deptos_e = ["(Todos)"] + sorted(df["DEPARTAMENTO"].dropna().unique().tolist())
-    depto_e_sel = st.selectbox("Departamento", deptos_e, key="depto_evol")
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        depto_e_sel = st.selectbox("Departamento", deptos_e, key="depto_evol")
 
     df_tabla = df.copy()
     if depto_e_sel != "(Todos)":
         df_tabla = df_tabla[df_tabla["DEPARTAMENTO"] == depto_e_sel]
+
+    with col_f2:
+        provs_e = ["(Todas)"] + sorted(df_tabla["PROVINCIA"].dropna().unique().tolist())
+        prov_e_sel = st.selectbox("Provincia", provs_e, key="prov_evol")
+    if prov_e_sel != "(Todas)":
+        df_tabla = df_tabla[df_tabla["PROVINCIA"] == prov_e_sel]
 
     cols_evol = [
         "DEPARTAMENTO", "PROVINCIA", "DISTRITO", "MCP", "COD_MCP_RENIEC",
@@ -438,11 +623,11 @@ elif pagina == "📈  Evolución de electores":
         "N_CORRECCIONES",
     ]
     st.caption(f"**{len(df_tabla):,}** MCPs")
-    st.dataframe(df_tabla[cols_evol].reset_index(drop=True), hide_index=True, width="stretch")
+    st.dataframe(con_nombres_amigables(df_tabla[cols_evol]).reset_index(drop=True), hide_index=True, width="stretch")
 
     st.download_button(
         "⬇ Descargar tabla (.xlsx)",
-        data=to_excel_bytes(df_tabla[cols_evol]),
+        data=to_excel_bytes(con_nombres_amigables(df_tabla[cols_evol])),
         file_name="mcp_evolucion.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
@@ -462,6 +647,10 @@ elif pagina == "⚠️  Mapa de errores":
         col1, col2, col3 = st.columns(3)
         with col1:
             depto_sel = st.selectbox("Departamento", deptos, key="depto_err")
+            provs = ["(Todas)"]
+            if depto_sel != "(Todos)":
+                provs += sorted(df[df["DEPARTAMENTO"] == depto_sel]["PROVINCIA"].dropna().unique().tolist())
+            prov_sel = st.selectbox("Provincia", provs, key="prov_err", disabled=(depto_sel == "(Todos)"))
         with col2:
             estado_sel = st.multiselect("Estado del error", ["SUBSANADO", "PENDIENTE"], default=[])
         with col3:
@@ -471,8 +660,6 @@ elif pagina == "⚠️  Mapa de errores":
     df_filt = df.copy()
     if depto_sel != "(Todos)":
         df_filt = df_filt[df_filt["DEPARTAMENTO"] == depto_sel]
-        provs = ["(Todas)"] + sorted(df_filt["PROVINCIA"].dropna().unique().tolist())
-        prov_sel = st.selectbox("Provincia", provs, key="prov_err")
         if prov_sel != "(Todas)":
             df_filt = df_filt[df_filt["PROVINCIA"] == prov_sel]
 
@@ -483,6 +670,100 @@ elif pagina == "⚠️  Mapa de errores":
     if solo_error:
         df_filt = df_filt[df_filt["ESTADO_ERROR"] != "SIN ERROR"]
 
+    # ── Gráfico: errores por provincia (respeta los filtros de arriba) ──────
+    st.subheader("Errores por provincia")
+    df_prov_chart = df_filt[df_filt["ESTADO_ERROR"] != "SIN ERROR"].copy()
+    if df_prov_chart.empty:
+        st.info("No hay MCPs con error para los filtros seleccionados.")
+    else:
+        df_prov_chart["PROV_LABEL"] = df_prov_chart["PROVINCIA"] + " (" + df_prov_chart["DEPARTAMENTO"] + ")"
+        heat_data = (
+            df_prov_chart.groupby(["PROV_LABEL", "ESTADO_ERROR"])
+            .size()
+            .reset_index(name="n")
+        )
+        # Si hay un departamento/provincia puntual filtrado se muestran todas
+        # sus provincias; si no, se limita a las 20 con más errores a nivel
+        # nacional para no saturar el eje.
+        if depto_sel == "(Todos)":
+            top_provs = heat_data.groupby("PROV_LABEL")["n"].sum().nlargest(20).index.tolist()
+            heat_data = heat_data[heat_data["PROV_LABEL"].isin(top_provs)]
+        fig_stk = px.bar(
+            heat_data, x="PROV_LABEL", y="n",
+            color="ESTADO_ERROR", barmode="stack",
+            color_discrete_map=ESTADO_COLOR_MAP,
+            labels={"n": "MCPs", "PROV_LABEL": "Provincia", "ESTADO_ERROR": "Estado"},
+        )
+        fig_stk.update_layout(
+            xaxis_tickangle=-40, margin=dict(t=10, b=90), legend_title="Estado del error",
+            xaxis={"categoryorder": "total descending"},
+        )
+        st.plotly_chart(fig_stk, width="stretch")
+
+    st.divider()
+
+    # ── Mapa de coropletas por provincia ─────────────────────────────────────
+    st.subheader("Mapa de coropletas — MCPs con error por provincia")
+    st.caption(
+        "Vista geográfica a nivel nacional (independiente de los filtros de arriba). "
+        "Elige si quieres ver el total de errores o el conteo de una causa específica."
+    )
+
+    if not GEOPANDAS_OK:
+        st.warning(
+            "El paquete `geopandas` no está disponible en este entorno, así que el mapa "
+            "de coropletas no se puede mostrar. Revisa `requirements.txt`."
+        )
+    else:
+        modo_mapa = st.radio(
+            "Ver mapa por:", ["Estado del error", "Causa específica"],
+            horizontal=True, key="modo_mapa",
+        )
+
+        df_err_nacional = df[df["ESTADO_ERROR"] != "SIN ERROR"].dropna(subset=["DEPARTAMENTO", "PROVINCIA"]).copy()
+        df_err_nacional["ID_PROV"] = df_err_nacional["DEPARTAMENTO"] + " - " + df_err_nacional["PROVINCIA"]
+
+        try:
+            geojson_prov = load_provincia_geojson()
+        except Exception as exc:  # noqa: BLE001 — mostramos el error, no rompemos el resto del tab
+            geojson_prov = None
+            st.error(f"No se pudo leer geofiles/PROVINCIA.gpkg: {exc}")
+
+        if geojson_prov is not None:
+            if modo_mapa == "Estado del error":
+                agg = df_err_nacional.groupby("ID_PROV").size().reset_index(name="MCPs con error")
+                color_col, color_scale, titulo = "MCPs con error", "Blues", "MCPs con error por provincia"
+            else:
+                causas_categoria = sorted(df_err_nacional["CAUSA_CATEGORIA"].dropna().unique().tolist())
+                causa_map_sel = st.selectbox("Categoría de causa", causas_categoria, key="causa_mapa")
+                df_causa = df_err_nacional[df_err_nacional["CAUSA_CATEGORIA"] == causa_map_sel]
+                agg = df_causa.groupby("ID_PROV").size().reset_index(name="MCPs")
+                color_col, color_scale = "MCPs", "Reds"
+                titulo = f"MCPs con causa '{causa_map_sel}' por provincia"
+
+            if agg.empty:
+                st.info("No hay MCPs para esta selección.")
+            else:
+                # Nota técnica: se usa choropleth_map (MapLibre) y NO choropleth
+                # (geo/d3-geo) porque este último tiene un bug de renderizado
+                # confirmado en esta versión de Plotly con GeoJSON custom de
+                # muchos polígonos: en vez de recortar cada polígono a su forma
+                # real, pinta todo el lienzo con el color de la última
+                # feature. choropleth_map no tiene ese problema y además trae
+                # mapa base real (ríos, fronteras, ciudades) de regalo.
+                fig_map = px.choropleth_map(
+                    agg, geojson=geojson_prov, locations="ID_PROV",
+                    featureidkey="properties.ID_PROV", color=color_col,
+                    color_continuous_scale=color_scale, title=titulo,
+                    center={"lat": -9.2, "lon": -75.0}, zoom=4.3, opacity=0.75,
+                )
+                fig_map.update_layout(margin=dict(t=40, b=10, l=0, r=0), height=560)
+                st.plotly_chart(fig_map, width="stretch")
+
+    st.divider()
+
+    # ── Tabla filtrable (al final, según lo pedido) ──────────────────────────
+    st.subheader("Tabla de MCPs con error")
     cols_show = [
         "DEPARTAMENTO", "PROVINCIA", "DISTRITO", "MCP", "COD_MCP_RENIEC",
         "ESTADO_ERROR", "CAUSA",
@@ -491,97 +772,14 @@ elif pagina == "⚠️  Mapa de errores":
     ]
 
     st.caption(f"**{len(df_filt):,}** MCPs")
-    st.dataframe(df_filt[cols_show].reset_index(drop=True), hide_index=True, width="stretch")
+    st.dataframe(con_nombres_amigables(df_filt[cols_show]).reset_index(drop=True), hide_index=True, width="stretch")
 
     st.download_button(
         "⬇ Descargar tabla filtrada (.xlsx)",
-        data=to_excel_bytes(df_filt[cols_show]),
+        data=to_excel_bytes(con_nombres_amigables(df_filt[cols_show])),
         file_name="mcp_errores.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-    st.divider()
-
-    st.subheader("Errores por tipo × departamento (Top 20)")
-    heat_data = (
-        df[df["ESTADO_ERROR"] != "SIN ERROR"]
-        .groupby(["DEPARTAMENTO", "ESTADO_ERROR"])
-        .size()
-        .reset_index(name="n")
-    )
-    top_deptos = heat_data.groupby("DEPARTAMENTO")["n"].sum().nlargest(20).index.tolist()
-    fig_stk = px.bar(
-        heat_data[heat_data["DEPARTAMENTO"].isin(top_deptos)],
-        x="DEPARTAMENTO", y="n",
-        color="ESTADO_ERROR", barmode="stack",
-        color_discrete_map=ESTADO_COLOR_MAP,
-        labels={"n": "MCPs", "DEPARTAMENTO": "Departamento", "ESTADO_ERROR": "Estado"},
-    )
-    fig_stk.update_layout(xaxis_tickangle=-40, margin=dict(t=10, b=90), legend_title="Estado del error")
-    st.plotly_chart(fig_stk, width="stretch")
-
-    st.divider()
-
-    # ── Treemap: distribución geográfica de errores ─────────────────────────
-    st.subheader("Mapa de calor geográfico — MCPs con error")
-    st.caption(
-        "Haz clic en un departamento para explorar sus provincias y MCPs individuales. "
-        "El color indica si el error está subsanado o pendiente."
-    )
-    # px.treemap exige que cada fila del `path` termine en una hoja real.
-    # Si DEPARTAMENTO/PROVINCIA/MCP viene NaN o "" en alguna fila, Plotly la
-    # trata como un nodo intermedio duplicado y falla con
-    # "ValueError: ... is not a leaf". Por eso se filtra antes de graficar
-    # en vez de dejar que Plotly infiera la jerarquía.
-    df_tree = (
-        df[df["ESTADO_ERROR"] != "SIN ERROR"][
-            ["DEPARTAMENTO", "PROVINCIA", "MCP", "ESTADO_ERROR", "CAUSA"]
-        ]
-        .dropna(subset=["DEPARTAMENTO", "PROVINCIA", "MCP"])
-        .copy()
-    )
-    df_tree = df_tree[
-        (df_tree["DEPARTAMENTO"] != "") &
-        (df_tree["PROVINCIA"] != "") &
-        (df_tree["MCP"] != "")
-    ]
-    df_tree["_n"] = 1
-
-    fig_tree = px.treemap(
-        df_tree,
-        path=["DEPARTAMENTO", "PROVINCIA", "MCP"],
-        values="_n",
-        color="ESTADO_ERROR",
-        color_discrete_map=ESTADO_COLOR_MAP,
-        hover_data={"ESTADO_ERROR": True, "CAUSA": True, "_n": False},
-    )
-    fig_tree.update_traces(textinfo="label")
-    fig_tree.update_layout(margin=dict(t=10, b=10), height=560, legend_title="Estado del error")
-    st.plotly_chart(fig_tree, width="stretch")
-
-    st.divider()
-
-    # ── Treemap secundario por causa ─────────────────────────────────────────
-    st.subheader("Mapa de calor por causa del error")
-    st.caption("Mismo universo de MCPs con error, coloreado por causa (causas con menos de 3 casos se agrupan en 'OTRAS').")
-
-    causa_counts = df_tree["CAUSA"].value_counts()
-    causas_chicas = causa_counts[causa_counts < 3].index
-    df_tree_causa = df_tree.copy()
-    df_tree_causa["CAUSA"] = df_tree_causa["CAUSA"].apply(
-        lambda c: "OTRAS" if c in causas_chicas or pd.isna(c) else c
-    )
-
-    fig_tree_causa = px.treemap(
-        df_tree_causa,
-        path=["DEPARTAMENTO", "PROVINCIA", "MCP"],
-        values="_n",
-        color="CAUSA",
-        hover_data={"CAUSA": True, "_n": False},
-    )
-    fig_tree_causa.update_traces(textinfo="label")
-    fig_tree_causa.update_layout(margin=dict(t=10, b=10), height=560, legend_title="Causa")
-    st.plotly_chart(fig_tree_causa, width="stretch")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -597,6 +795,18 @@ elif pagina == "🔍  Ficha por MCP":
         busqueda = st.text_input("Nombre de MCP", placeholder="Ej: CHOMZA ALTA")
     with col2:
         cod_busq = st.text_input("Código RENIEC", placeholder="Ej: 010201100")
+
+    col3, col4 = st.columns(2)
+    with col3:
+        deptos_ficha = ["(Todos)"] + sorted(df["DEPARTAMENTO"].dropna().unique().tolist())
+        depto_ficha_sel = st.selectbox("Departamento", deptos_ficha, key="depto_ficha")
+    with col4:
+        provs_ficha = ["(Todas)"]
+        if depto_ficha_sel != "(Todos)":
+            provs_ficha += sorted(df[df["DEPARTAMENTO"] == depto_ficha_sel]["PROVINCIA"].dropna().unique().tolist())
+        prov_ficha_sel = st.selectbox(
+            "Provincia", provs_ficha, key="prov_ficha", disabled=(depto_ficha_sel == "(Todos)")
+        )
 
     def build_timeline(row: pd.Series) -> pd.DataFrame:
         """Construye el DataFrame de trayectoria con columna '_estado' para colorear."""
@@ -651,12 +861,17 @@ elif pagina == "🔍  Ficha por MCP":
 
         return display_df.style.apply(row_color, axis=1)
 
-    if busqueda or cod_busq:
+    hay_filtro_geo = depto_ficha_sel != "(Todos)"
+    if busqueda or cod_busq or hay_filtro_geo:
         mask = pd.Series([True] * len(df))
         if busqueda:
             mask &= df["MCP"].str.contains(busqueda.strip().upper(), na=False, regex=False)
         if cod_busq:
             mask &= df["COD_MCP_RENIEC"].fillna("").str.contains(cod_busq.strip(), regex=False)
+        if depto_ficha_sel != "(Todos)":
+            mask &= df["DEPARTAMENTO"] == depto_ficha_sel
+            if prov_ficha_sel != "(Todas)":
+                mask &= df["PROVINCIA"] == prov_ficha_sel
 
         resultados = df[mask]
 
@@ -697,6 +912,7 @@ elif pagina == "🔍  Ficha por MCP":
                             markers=True, symbol="ES_ESTIMADO",
                             symbol_map={True: "circle-open", False: "circle"},
                         )
+                        fig_tl.update_traces(line_color=RENIEC_AZUL)
                         fig_tl.update_layout(
                             margin=dict(t=10, b=10), height=280,
                             showlegend=False, xaxis_title="Etapa", yaxis_title="Electores",
@@ -707,7 +923,7 @@ elif pagina == "🔍  Ficha por MCP":
                     st.dataframe(style_timeline(df_tl), hide_index=True, width="stretch")
 
     else:
-        st.info("Ingresa un nombre o código para buscar.")
+        st.info("Ingresa un nombre, código, o elige un departamento/provincia para buscar.")
 
         st.subheader("MCPs con error pendiente — muestra")
         sample = (
@@ -719,4 +935,4 @@ elif pagina == "🔍  Ficha por MCP":
             .head(30)
             .reset_index(drop=True)
         )
-        st.dataframe(sample, hide_index=True, width="stretch")
+        st.dataframe(con_nombres_amigables(sample), hide_index=True, width="stretch")
