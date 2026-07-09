@@ -32,8 +32,7 @@ import streamlit as st
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATABASES_DIR = Path(__file__).parent / "DATABASES"
-PADRON_PATH = DATABASES_DIR / "PADRON_MODIFICACIONES_VF.xlsx"
+PADRON_PATH = DATABASES/"PADRON_MODIFICACIONES_VF.xlsx"
 
 ETAPAS_ORDEN = ["FEBRERO", "ABRIL", "JUNIO_1", "JUNIO_2", "FINAL"]
 
