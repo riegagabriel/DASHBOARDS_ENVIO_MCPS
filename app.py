@@ -32,7 +32,12 @@ import streamlit as st
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-PADRON_PATH = DATABASES/"PADRON_MODIFICACIONES_VF.xlsx"
+
+# Definir la ruta base apuntando a la carpeta de datos
+DATABASES = Path("DATABASES") 
+
+# Ahora esto funcionará correctamente
+PADRON_PATH = DATABASES / "PADRON_MODIFICACIONES_VF.xlsx"
 
 ETAPAS_ORDEN = ["FEBRERO", "ABRIL", "JUNIO_1", "JUNIO_2", "FINAL"]
 
